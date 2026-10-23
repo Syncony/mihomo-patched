@@ -62,6 +62,18 @@ jobs:
             darwin-amd64-v3.gz darwin-arm64.gz \
             windows-amd64-v3.zip windows-arm64.zip
 
+      - name: Build android-arm64-v8
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" \
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+            go build -tags with_gvisor -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=$(date -u)' -w -s -buildid=" \
+              -o bin/mihomo-android-arm64-v8
+          gzip -f -S "-${VERSION}.gz" bin/mihomo-android-arm64-v8
+
       - name: Release
         if: steps.ver.outputs.exists == 'false'
         working-directory: src
