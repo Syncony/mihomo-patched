@@ -1,0 +1,75 @@
+name: Build patched mihomo Alpha
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout upstream Alpha
+        uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/mihomo
+          ref: Alpha
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version and check existing release
+        id: ver
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "version=alpha-${SHA}-reality-mlkem" >> "$GITHUB_OUTPUT"
+          if gh release view "alpha-${SHA}-reality-mlkem" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply patch
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git am --3way ../self/patches/*.patch
+
+      - name: Set up Go
+        if: steps.ver.outputs.exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          make VERSION=${{ steps.ver.outputs.version }} \
+            linux-amd64-v3.gz linux-arm64.gz \
+            darwin-amd64-v3.gz darwin-arm64.gz \
+            windows-amd64-v3.zip windows-arm64.zip
+
+      - name: Release
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.version }}" bin/*.gz bin/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.ver.outputs.version }}" \
+            --notes "Upstream MetaCubeX/mihomo Alpha with patches/ applied." \
+            --prerelease
