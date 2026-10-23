@@ -1,0 +1,215 @@
+From 7185ca6d126d26e4efa41a8541f9482714295d8b Mon Sep 17 00:00:00 2001
+From: Syncony <110027245+Syncony@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 12:29:44 +0800
+Subject: [PATCH] feat(outbound): add preconnect option to keep idle TCP
+ connections ready
+
+Add a per-proxy `preconnect: N` option. When set, a small pool of idle
+TCP connections to the proxy server (or through dialer-proxy) is kept
+warm in the background so new dials skip the handshake RTT. The pool is
+created lazily and stops refilling after 60s without use. Disabled when
+tfo is enabled.
+---
+ adapter/outbound/base.go       |   7 ++
+ adapter/outbound/preconnect.go | 162 +++++++++++++++++++++++++++++++++
+ 2 files changed, 169 insertions(+)
+ create mode 100644 adapter/outbound/preconnect.go
+
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index d6942ba0..a4f021da 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -197,6 +197,7 @@ type BasicOption struct {
+ 	RoutingMark int         `proxy:"routing-mark,omitempty"`
+ 	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
+ 	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
++	Preconnect  int         `proxy:"preconnect,omitempty"`   // number of idle TCP connections kept ready to the proxy server
+ 
+ 	//
+ 	// The following parameters are used internally, assign value by the structure decoder are disallowed
+@@ -211,8 +212,14 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
+ 	if cDialer == nil {
+ 		if b.DialerProxy != "" {
+ 			cDialer = proxydialer.NewByName(b.DialerProxy, b.NewTunnel())
++			if b.Preconnect > 0 {
++				cDialer = newPreconnectDialer(cDialer, b.Preconnect, false)
++			}
+ 		} else {
+ 			cDialer = dialer.NewDialer(opts...)
++			if b.Preconnect > 0 && !b.TFO { // TFO defers connect until first write, nothing to pre-establish
++				cDialer = newPreconnectDialer(cDialer, b.Preconnect, true)
++			}
+ 		}
+ 	}
+ 	return cDialer
+diff --git a/adapter/outbound/preconnect.go b/adapter/outbound/preconnect.go
+new file mode 100644
+index 00000000..81f45d04
+--- /dev/null
++++ b/adapter/outbound/preconnect.go
+@@ -0,0 +1,162 @@
++package outbound
++
++import (
++	"context"
++	"net"
++	"sync"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++const (
++	preconnectMaxAge      = 15 * time.Second // pooled conns older than this are closed and replaced
++	preconnectIdleStop    = 60 * time.Second // stop refilling when the pool has not been used for this long
++	preconnectDialTimeout = 5 * time.Second
++	preconnectRefillTick  = 200 * time.Millisecond
++	preconnectErrBackoff  = 2 * time.Second
++)
++
++// preconnectDialer keeps a few idle TCP connections to each address so that
++// the TCP handshake is already done when a new tcp dial arrives.
++type preconnectDialer struct {
++	C.Dialer
++	size  int
++	probe bool // probe pooled conns with a read; unsafe for proxied conns that parse a response header lazily
++	mu    sync.Mutex
++	pools map[string]*preconnectPool
++}
++
++func newPreconnectDialer(inner C.Dialer, size int, probe bool) C.Dialer {
++	return &preconnectDialer{Dialer: inner, size: size, probe: probe, pools: make(map[string]*preconnectPool)}
++}
++
++func (d *preconnectDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	if network != "tcp" {
++		return d.Dialer.DialContext(ctx, network, address)
++	}
++	d.mu.Lock()
++	p, ok := d.pools[address]
++	if !ok {
++		p = &preconnectPool{
++			size:    d.size,
++			probe:   d.probe,
++			lastUse: time.Now(),
++			dial: func(ctx context.Context) (net.Conn, error) {
++				return d.Dialer.DialContext(ctx, network, address)
++			},
++		}
++		d.pools[address] = p
++	}
++	d.mu.Unlock()
++
++	if c := p.get(); c != nil {
++		return c, nil
++	}
++	return d.Dialer.DialContext(ctx, network, address)
++}
++
++type preconnectEntry struct {
++	conn net.Conn
++	at   time.Time
++}
++
++type preconnectPool struct {
++	dial    func(ctx context.Context) (net.Conn, error)
++	size    int
++	probe   bool
++	mu      sync.Mutex
++	conns   []preconnectEntry
++	filling bool
++	lastUse time.Time
++}
++
++// get returns a live pooled conn or nil, and makes sure the refill loop is running.
++func (p *preconnectPool) get() net.Conn {
++	p.mu.Lock()
++	p.lastUse = time.Now()
++	if !p.filling {
++		p.filling = true
++		go p.fill()
++	}
++	p.mu.Unlock()
++
++	for {
++		p.mu.Lock()
++		n := len(p.conns)
++		if n == 0 {
++			p.mu.Unlock()
++			return nil
++		}
++		e := p.conns[n-1] // newest first
++		p.conns = p.conns[:n-1]
++		p.mu.Unlock()
++
++		if preconnectAlive(e, p.probe) {
++			return e.conn
++		}
++		_ = e.conn.Close()
++	}
++}
++
++func (p *preconnectPool) fill() {
++	for {
++		p.mu.Lock()
++		now := time.Now()
++		if now.Sub(p.lastUse) > preconnectIdleStop {
++			conns := p.conns
++			p.conns = nil
++			p.filling = false
++			p.mu.Unlock()
++			for _, e := range conns {
++				_ = e.conn.Close()
++			}
++			return
++		}
++		kept := p.conns[:0]
++		for _, e := range p.conns {
++			if now.Sub(e.at) > preconnectMaxAge {
++				_ = e.conn.Close()
++			} else {
++				kept = append(kept, e)
++			}
++		}
++		p.conns = kept
++		need := p.size - len(p.conns)
++		p.mu.Unlock()
++
++		if need <= 0 {
++			time.Sleep(preconnectRefillTick)
++			continue
++		}
++		ctx, cancel := context.WithTimeout(context.Background(), preconnectDialTimeout)
++		conn, err := p.dial(ctx)
++		cancel()
++		if err != nil {
++			time.Sleep(preconnectErrBackoff)
++			continue
++		}
++		p.mu.Lock()
++		p.conns = append(p.conns, preconnectEntry{conn: conn, at: time.Now()})
++		p.mu.Unlock()
++	}
++}
++
++// preconnectAlive reports whether the pooled conn is young enough and not closed by the peer.
++func preconnectAlive(e preconnectEntry, probe bool) bool {
++	if time.Since(e.at) > preconnectMaxAge {
++		return false
++	}
++	if !probe {
++		return true
++	}
++	var buf [1]byte
++	_ = e.conn.SetReadDeadline(time.Now())
++	n, err := e.conn.Read(buf[:])
++	_ = e.conn.SetReadDeadline(time.Time{})
++	if n > 0 {
++		return false
++	}
++	ne, ok := err.(net.Error)
++	return ok && ne.Timeout()
++}
+-- 
+2.55.0.windows.5
+
