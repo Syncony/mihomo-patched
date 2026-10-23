@@ -32,8 +32,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           SHA=$(git rev-parse --short HEAD)
-          echo "version=alpha-${SHA}-reality-mlkem" >> "$GITHUB_OUTPUT"
-          if gh release view "alpha-${SHA}-reality-mlkem" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          echo "version=alpha-${SHA}-p" >> "$GITHUB_OUTPUT"
+          if gh release view "alpha-${SHA}-p" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
