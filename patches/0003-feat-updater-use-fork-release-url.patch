@@ -1,0 +1,32 @@
+From 798d5bd85a6f5037ab6ed7659cae01f76e1e323c Mon Sep 17 00:00:00 2001
+From: Syncony <snlaxer@gmail.com>
+Date: Sat, 24 Oct 2026 17:51:04 +0800
+Subject: [PATCH] feat(updater): use fork release url
+
+---
+ component/updater/update_core.go | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/component/updater/update_core.go b/component/updater/update_core.go
+index 0afa94a..8762e2a 100644
+--- a/component/updater/update_core.go
++++ b/component/updater/update_core.go
+@@ -24,11 +24,11 @@ import (
+ )
+ 
+ const (
+-	baseReleaseURL    = "https://github.com/MetaCubeX/mihomo/releases/latest/download/"
+-	versionReleaseURL = "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt"
++	baseReleaseURL    = "https://github.com/Syncony/mihomo-patched/releases/latest/download/"
++	versionReleaseURL = "https://github.com/Syncony/mihomo-patched/releases/latest/download/version.txt"
+ 
+-	baseAlphaURL    = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/"
+-	versionAlphaURL = "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt"
++	baseAlphaURL    = "https://github.com/Syncony/mihomo-patched/releases/latest/download/"
++	versionAlphaURL = "https://github.com/Syncony/mihomo-patched/releases/latest/download/version.txt"
+ 
+ 	// MaxPackageFileSize is a maximum package file length in bytes. The largest
+ 	// package whose size is limited by this constant currently has the size of
+-- 
+2.55.0.windows.5
+

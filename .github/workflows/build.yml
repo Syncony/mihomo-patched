@@ -80,8 +80,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.ver.outputs.version }}" bin/*.gz bin/*.zip \
+          echo "${{ steps.ver.outputs.version }}" > bin/version.txt
+          gh release create "${{ steps.ver.outputs.version }}" bin/*.gz bin/*.zip bin/version.txt \
             --repo "${{ github.repository }}" \
             --title "${{ steps.ver.outputs.version }}" \
             --notes "Upstream MetaCubeX/mihomo Alpha with patches/ applied." \
-            --prerelease
+            --latest
