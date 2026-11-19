@@ -1,0 +1,328 @@
+From 5c05f04ba041da3656561f053ea93b3c1ad6d1db Mon Sep 17 00:00:00 2001
+From: ci <ci@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:56:07 +0800
+Subject: [PATCH] feat(outbound): preconnect keeps TCP conns to the proxy
+ server warm
+
+Add a `preconnect: N` option to every proxy. While the proxy carries
+real traffic, its dialer keeps N connected TCP conns to the proxy
+server, so a new connection skips the TCP handshake. It replaces the
+anytls-only session preconnect.
+
+The server address is the first one dialed over tcp by real traffic;
+other addresses and packet dials pass through. The pool starts on the
+first such dial and stops, closing its conns, after 15s without one.
+Delay tests (URLTest) mark their context with C.WithHealthCheck and
+neither start, extend nor take from it.
+
+Pooled conns are recycled after 15s, or at 80% of the shortest idle
+limit the server was seen to enforce. A 1ms read evicts conns the server
+closed; bytes a server sends first, like an SSH banner, are kept and
+handed back. Conns from a dialer-proxy are aged out only. TCP Fast Open
+dials connect on their first write, so tfo turns preconnect off.
+---
+ adapter/adapter.go       |   3 +-
+ adapter/outbound/base.go |   3 +-
+ adapter/outbound/warm.go | 231 +++++++++++++++++++++++++++++++++++++++
+ constant/healthcheck.go  |  16 +++
+ 4 files changed, 251 insertions(+), 2 deletions(-)
+ create mode 100644 adapter/outbound/warm.go
+ create mode 100644 constant/healthcheck.go
+
+diff --git a/adapter/adapter.go b/adapter/adapter.go
+index 422232b3..f2ac89bc 100644
+--- a/adapter/adapter.go
++++ b/adapter/adapter.go
+@@ -207,7 +207,8 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
+ 	}
+ 
+ 	start := time.Now()
+-	instance, err := p.DialContext(ctx, &addr)
++	// Marked so that a delay test does not keep preconnected conns warm.
++	instance, err := p.DialContext(C.WithHealthCheck(ctx), &addr)
+ 	if err != nil {
+ 		return
+ 	}
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index d6942ba0..1f58c41f 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -197,6 +197,7 @@ type BasicOption struct {
+ 	RoutingMark int         `proxy:"routing-mark,omitempty"`
+ 	IPVersion   C.DNSPrefer `proxy:"ip-version,omitempty"`
+ 	DialerProxy string      `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
++	Preconnect  int         `proxy:"preconnect,omitempty"`   // number of connected TCP conns kept ready while the proxy carries traffic
+ 
+ 	//
+ 	// The following parameters are used internally, assign value by the structure decoder are disallowed
+@@ -215,7 +216,7 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
+ 			cDialer = dialer.NewDialer(opts...)
+ 		}
+ 	}
+-	return cDialer
++	return newWarmDialer(cDialer, b)
+ }
+ 
+ func (b *BasicOption) NewTunnel() C.Tunnel {
+diff --git a/adapter/outbound/warm.go b/adapter/outbound/warm.go
+new file mode 100644
+index 00000000..28e3d95e
+--- /dev/null
++++ b/adapter/outbound/warm.go
+@@ -0,0 +1,231 @@
++package outbound
++
++import (
++	"context"
++	"net"
++	"sync"
++	"time"
++
++	N "github.com/metacubex/mihomo/common/net"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++const (
++	warmMaxAge     = 15 * time.Second // pooled conns older than this are closed and replaced
++	warmRefillTick = 200 * time.Millisecond
++	warmErrBackoff = 2 * time.Second
++	// A pooled conn the server closed sooner than this is taken as a network blip,
++	// not as the server's idle limit.
++	warmMinLifetime = time.Second
++	// The pool stops refilling and drops its conns after this long without a dial
++	// from real traffic.
++	warmIdleStop = 15 * time.Second
++)
++
++// warmDialer keeps up to size connected TCP conns to the proxy server while the
++// proxy carries real traffic, so a new connection skips the TCP handshake. The
++// server address is the first one dialed over tcp by real traffic; dials to other
++// addresses, packet dials and delay tests pass through.
++type warmDialer struct {
++	C.Dialer
++	size int
++
++	mu       sync.Mutex
++	addr     string
++	conns    []warmEntry
++	filling  bool
++	inflight int
++	errUntil time.Time
++	lastUse  time.Time
++	lifetime time.Duration // shortest time the server was seen to keep an idle conn; 0 until seen
++}
++
++type warmEntry struct {
++	conn   net.Conn
++	probe  bool   // conn is a local socket, so a read only sees the server
++	cached []byte // read by probes, handed back before anything else
++	at     time.Time
++}
++
++// newWarmDialer wraps d unless preconnect is off. A TCP Fast Open dial connects on
++// its first write, so a pooled one would not be connected.
++func newWarmDialer(d C.Dialer, option *BasicOption) C.Dialer {
++	if option.Preconnect <= 0 || option.TFO {
++		return d
++	}
++	return &warmDialer{Dialer: d, size: option.Preconnect}
++}
++
++func (w *warmDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	if network != "tcp" || C.IsHealthCheck(ctx) {
++		return w.Dialer.DialContext(ctx, network, address)
++	}
++	w.mu.Lock()
++	if w.addr == "" {
++		w.addr = address
++	}
++	if address != w.addr {
++		w.mu.Unlock()
++		return w.Dialer.DialContext(ctx, network, address)
++	}
++	w.lastUse = time.Now()
++	if !w.filling {
++		w.filling = true
++		go w.fill()
++	}
++	c := w.takeLocked()
++	w.mu.Unlock()
++	if c != nil {
++		return c, nil
++	}
++	return w.Dialer.DialContext(ctx, network, address)
++}
++
++// takeLocked returns a live pooled conn, newest first, or nil.
++func (w *warmDialer) takeLocked() net.Conn {
++	now := time.Now()
++	for n := len(w.conns); n > 0; n = len(w.conns) {
++		e := &w.conns[n-1]
++		w.conns = w.conns[:n-1]
++		if w.aliveLocked(e, now) {
++			if len(e.cached) > 0 {
++				return N.NewCachedConn(e.conn, e.cached)
++			}
++			return e.conn
++		}
++		_ = e.conn.Close()
++	}
++	return nil
++}
++
++func (w *warmDialer) fill() {
++	for {
++		w.mu.Lock()
++		now := time.Now()
++		if now.Sub(w.lastUse) > warmIdleStop {
++			conns := w.conns
++			w.conns = nil
++			w.filling = false
++			w.mu.Unlock()
++			for _, e := range conns {
++				_ = e.conn.Close()
++			}
++			return
++		}
++		// Evict conns that aged out or that the server already closed, so the pool
++		// is refilled now instead of handing out a dead conn later.
++		kept := w.conns[:0]
++		for i := range w.conns {
++			e := w.conns[i]
++			if w.aliveLocked(&e, now) {
++				kept = append(kept, e)
++			} else {
++				_ = e.conn.Close()
++			}
++		}
++		w.conns = kept
++		need := 0
++		if now.After(w.errUntil) {
++			need = w.size - len(w.conns) - w.inflight
++		}
++		if need > 0 {
++			w.inflight += need
++		}
++		addr := w.addr
++		w.mu.Unlock()
++
++		for i := 0; i < need; i++ {
++			go w.prepareOne(addr)
++		}
++		time.Sleep(warmRefillTick)
++	}
++}
++
++func (w *warmDialer) prepareOne(addr string) {
++	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
++	c, err := w.Dialer.DialContext(ctx, "tcp", addr)
++	cancel()
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	w.inflight--
++	if err != nil {
++		w.errUntil = time.Now().Add(warmErrBackoff)
++		return
++	}
++	if !w.filling {
++		_ = c.Close()
++		return
++	}
++	w.conns = append(w.conns, warmEntry{conn: c, probe: isLocalSocket(c), at: time.Now()})
++}
++
++// maxAgeLocked recycles conns at 80% of the learned server idle limit, never later
++// than warmMaxAge.
++func (w *warmDialer) maxAgeLocked() time.Duration {
++	if w.lifetime == 0 || w.lifetime*4/5 > warmMaxAge {
++		return warmMaxAge
++	}
++	return w.lifetime * 4 / 5
++}
++
++// aliveLocked reports whether the pooled conn is young enough and not closed by the
++// server, learning the server's idle limit from conns it closed.
++func (w *warmDialer) aliveLocked(e *warmEntry, now time.Time) bool {
++	age := now.Sub(e.at)
++	if age > w.maxAgeLocked() {
++		if w.lifetime > 0 {
++			// Survived to the limit: let the estimate creep back up in case the
++			// shortest one was a fluke.
++			w.lifetime += w.lifetime / 16
++			if w.lifetime*4/5 > warmMaxAge {
++				w.lifetime = 0 // no longer binding
++			}
++		}
++		return false
++	}
++	if !e.probe {
++		return true
++	}
++	// An already expired deadline fails the read before the socket is looked at,
++	// so give it a moment to report a FIN or RST that has arrived.
++	var buf [2048]byte
++	_ = e.conn.SetReadDeadline(time.Now().Add(time.Millisecond))
++	n, err := e.conn.Read(buf[:])
++	_ = e.conn.SetReadDeadline(time.Time{})
++	if n > 0 {
++		// Some servers speak first, as an SSH server sends its banner. Keep what
++		// was read for the user of the conn and look again next time.
++		e.cached = append(e.cached, buf[:n]...)
++		return true
++	}
++	if ne, ok := err.(net.Error); ok && ne.Timeout() {
++		return true
++	}
++	if age >= warmMinLifetime && (w.lifetime == 0 || age < w.lifetime) {
++		w.lifetime = age
++	}
++	return false
++}
++
++type upstreamConn interface {
++	Upstream() any
++}
++
++// isLocalSocket reports whether c is a TCP socket of this host, maybe wrapped.
++// Conns from a dialer-proxy are not, and may parse their own response lazily.
++func isLocalSocket(c net.Conn) bool {
++	for c != nil {
++		switch c.(type) {
++		case *net.TCPConn:
++			return true
++		case C.Conn:
++			return false
++		}
++		u, ok := c.(upstreamConn)
++		if !ok {
++			return false
++		}
++		c, _ = u.Upstream().(net.Conn)
++	}
++	return false
++}
+diff --git a/constant/healthcheck.go b/constant/healthcheck.go
+new file mode 100644
+index 00000000..de879dba
+--- /dev/null
++++ b/constant/healthcheck.go
+@@ -0,0 +1,16 @@
++package constant
++
++import "context"
++
++type healthCheckKey struct{}
++
++// WithHealthCheck marks ctx as carrying a delay test rather than user traffic.
++func WithHealthCheck(ctx context.Context) context.Context {
++	return context.WithValue(ctx, healthCheckKey{}, true)
++}
++
++// IsHealthCheck reports whether ctx was marked by WithHealthCheck.
++func IsHealthCheck(ctx context.Context) bool {
++	v, _ := ctx.Value(healthCheckKey{}).(bool)
++	return v
++}
+-- 
+2.55.0.windows.5
+

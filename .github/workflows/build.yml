@@ -1,0 +1,116 @@
+name: Build patched mihomo Alpha
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout upstream Alpha
+        uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/mihomo
+          ref: Alpha
+          path: src
+          fetch-depth: 0
+
+      - name: Resolve version and check existing release
+        id: ver
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          # Patch content is part of the version, so a patch change rebuilds even when upstream did not move.
+          PATCHES=$(cat ../self/patches/*.patch | sha256sum | cut -c1-7)
+          VERSION="alpha-${SHA}-p${PATCHES}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply patch
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          git am --3way ../self/patches/*.patch
+
+      - name: Set up Go
+        if: steps.ver.outputs.exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: src/go.sum
+
+      - name: Test patched packages
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: go test -race -count=1 ./transport/anytls/... ./constant/
+
+      - name: Build
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          make VERSION=${{ steps.ver.outputs.version }} \
+            linux-amd64-v3.gz linux-amd64-v1.gz linux-arm64.gz \
+            darwin-amd64-v3.gz darwin-amd64-v1.gz darwin-arm64.gz \
+            windows-amd64-v3.zip windows-amd64-v1.zip windows-arm64.zip
+
+      - name: Build android-arm64-v8
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        run: |
+          VERSION=${{ steps.ver.outputs.version }}
+          CC="${ANDROID_NDK_LATEST_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" \
+          CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+            go build -tags with_gvisor -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=$(date -u)' -w -s -buildid=" \
+              -o bin/mihomo-android-arm64-v8
+          gzip -f -S "-${VERSION}.gz" bin/mihomo-android-arm64-v8
+
+      - name: Release
+        if: steps.ver.outputs.exists == 'false'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "${{ steps.ver.outputs.version }}" > bin/version.txt
+          # A release is dated by the commit its tag points to, and every scheduled
+          # build shares the head of main, so tag a commit made now instead.
+          REPO="${{ github.repository }}"
+          TAG="${{ steps.ver.outputs.version }}"
+          TREE=$(gh api "repos/${REPO}/git/commits/${GITHUB_SHA}" --jq .tree.sha)
+          COMMIT=$(gh api "repos/${REPO}/git/commits" -f message="Release ${TAG}" -f tree="${TREE}" -f "parents[]=${GITHUB_SHA}" --jq .sha)
+          # A tag left by a run that failed before releasing is replaced.
+          gh api -X DELETE "repos/${REPO}/git/refs/tags/${TAG}" >/dev/null 2>&1 || true
+          gh api "repos/${REPO}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${COMMIT}" >/dev/null
+          gh release create "${{ steps.ver.outputs.version }}" bin/*.gz bin/*.zip bin/version.txt \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --title "${{ steps.ver.outputs.version }}" \
+            --notes "Upstream MetaCubeX/mihomo Alpha with patches/ applied." \
+            --latest

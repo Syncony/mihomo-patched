@@ -1,0 +1,653 @@
+From 1f200714c1490ffdc1d4dff7e508e5e6f6956457 Mon Sep 17 00:00:00 2001
+From: Syncony <110027245+Syncony@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:14:33 +0800
+Subject: [PATCH 3/5] feat(anytls): heartbeat health checks and latency-aware
+ session pick
+
+Client:
+- Ping idle sessions with cmdHeartRequest at a random interval of
+  10-30s, so heartbeats neither keep a mobile radio awake nor form a
+  regular traffic pattern. Pongs give an RTT estimate (RFC 6298
+  SRTT/RTTVAR).
+- Close idle sessions whose ping is overdue (3-10s, from the RTT), so a
+  request never lands on a session that died in the pool.
+- Pick the idle session expected to answer soonest instead of the newest.
+
+Negotiation:
+- The client adds "x-hk=1" to its settings; a patched server echoes it in
+  cmdServerSettings. Unpatched peers ignore unknown keys.
+- With a patched server, SYNACK (sent before dialing the destination) is
+  also an RTT sample and the reused-session SYNACK deadline follows the
+  RTT, never below the original 3s.
+- A late SYNACK no longer closes a session that received frames after the
+  SYN, so one slow stream does not tear down the busy ones beside it.
+
+Server:
+- Dynamic record sizing: after 1s idle, data frames start at one TCP
+  segment per TLS record and grow by a segment per frame up to 16 KiB.
+  Keeping the congestion window open across idle periods is left to the
+  kernel (net.ipv4.tcp_slow_start_after_idle=0) instead of server pings.
+---
+ transport/anytls/session/client.go      |  49 ++++-
+ transport/anytls/session/health.go      | 234 ++++++++++++++++++++++++
+ transport/anytls/session/health_test.go | 164 +++++++++++++++++
+ transport/anytls/session/session.go     |  49 ++++-
+ 4 files changed, 486 insertions(+), 10 deletions(-)
+ create mode 100644 transport/anytls/session/health.go
+ create mode 100644 transport/anytls/session/health_test.go
+
+diff --git a/transport/anytls/session/client.go b/transport/anytls/session/client.go
+index e3626bf9..f4b146c2 100644
+--- a/transport/anytls/session/client.go
++++ b/transport/anytls/session/client.go
+@@ -57,6 +57,7 @@ func NewClient(ctx context.Context, dialOut util.DialOutFunc, _padding *atomic.P
+ 	c.idleSession = skiplist.NewSkipList[uint64, *Session]()
+ 	if !c.disableReuse {
+ 		util.StartRoutine(c.die, idleSessionCheckInterval, c.idleCleanup)
++		util.StartRoutine(c.die, healthTick, c.healthCheck)
+ 	}
+ 	return c
+ }
+@@ -111,17 +112,57 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
+ 	return stream, nil
+ }
+ 
++// getIdleSession takes the idle session expected to answer soonest, preferring the
++// newest among those tied, and skips any whose heartbeat is overdue.
+ func (c *Client) getIdleSession() (idle *Session) {
++	now := time.Now()
++	var keys []uint64
++	var sessions []*Session
++	var waits []time.Duration
+ 	c.idleSessionLock.Lock()
+-	if !c.idleSession.IsEmpty() {
+-		it := c.idleSession.Iterate()
+-		idle = it.Value()
+-		c.idleSession.Remove(it.Key())
++	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
++		session := it.Value()
++		if session.unresponsive(now) {
++			continue // healthCheck closes it
++		}
++		keys = append(keys, it.Key())
++		sessions = append(sessions, session)
++		waits = append(waits, session.expectedWait(now))
++	}
++	if i := choose(waits); i >= 0 {
++		idle = sessions[i]
++		c.idleSession.Remove(keys[i])
+ 	}
+ 	c.idleSessionLock.Unlock()
+ 	return
+ }
+ 
++// healthCheck pings idle sessions and closes those that stopped answering, so a
++// request never lands on a session that died while it sat in the pool.
++func (c *Client) healthCheck() {
++	now := time.Now()
++	var dead, due []*Session
++	c.idleSessionLock.Lock()
++	for it := c.idleSession.Iterate(); it.IsNotEnd(); {
++		key, session := it.Key(), it.Value()
++		it.MoveToNext()
++		if session.unresponsive(now) {
++			c.idleSession.Remove(key)
++			dead = append(dead, session)
++		} else if session.pingDue(now) {
++			due = append(due, session)
++		}
++	}
++	c.idleSessionLock.Unlock()
++	for _, session := range dead {
++		session.Close()
++	}
++	for _, session := range due {
++		// A stuck write must not hold up the other sessions' checks.
++		go session.ping()
++	}
++}
++
+ func (c *Client) createSession(ctx context.Context) (*Session, error) {
+ 	underlying, err := c.dialOut(ctx)
+ 	if err != nil {
+diff --git a/transport/anytls/session/health.go b/transport/anytls/session/health.go
+new file mode 100644
+index 00000000..f88df60a
+--- /dev/null
++++ b/transport/anytls/session/health.go
+@@ -0,0 +1,234 @@
++package session
++
++import (
++	"math/rand"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++const (
++	// extKey is sent in the client's settings and echoed in the server's by peers
++	// that run this patch; peers without it ignore unknown keys.
++	extKey   = "x-hk"
++	extValue = "1"
++
++	healthTick = 500 * time.Millisecond
++	// Idle sessions are pinged at a random interval in [pingInterval, pingInterval+pingJitter),
++	// so heartbeats neither keep a mobile radio awake nor form a regular pattern.
++	pingInterval = 10 * time.Second
++	pingJitter   = 20 * time.Second
++	// A reply is overdue after TCP's retransmission timeout (RFC 6298: SRTT + 4·RTTVAR)
++	// but never under replyRoundTrips smoothed round trips, kept within
++	// minReplyDeadline and maxReplyDeadline, and minReplyDeadline until measured.
++	// The floor matches the fixed 3s SYNACK deadline of the unpatched client.
++	minReplyDeadline = 3 * time.Second
++	maxReplyDeadline = 10 * time.Second
++	replyRoundTrips  = 5
++	// Expected waits within this band of the best, or a quarter of it, count as tied.
++	minWaitBand = 20 * time.Millisecond
++
++	// Dynamic record sizing for server writes: after an idle second a burst starts
++	// with frames that fit one TCP segment inside one TLS record and grows by a
++	// segment per frame up to a full TLS record.
++	drsSegment   = 1208 - 22 - headerOverHeadSize // Go's TLS MSS estimate minus TLS 1.3 and frame overhead
++	drsMax       = 16384 - headerOverHeadSize
++	drsIdleReset = time.Second
++)
++
++type sessionHealth struct {
++	lastRecv atomic.Int64 // unix nanoseconds of the last frame received
++	synSent  atomic.Int64 // unix nanoseconds of the SYN still waiting for its SYNACK
++	latest   atomic.Int64 // latest round trip in nanoseconds; 0 until the first
++	pinging  atomic.Bool
++
++	mu       sync.Mutex
++	pings    map[uint32]time.Time // pings still waiting for their response
++	nextPing uint32
++	pingAt   time.Time // when the next ping is due; zero pings at once
++	srtt     time.Duration
++	rttvar   time.Duration
++
++	drsMu    sync.Mutex
++	drsLimit int
++	drsLast  time.Time
++}
++
++func (s *Session) sample(rtt time.Duration) {
++	// Zero means unmeasured; a coarse clock can read a LAN round trip as zero.
++	rtt = maxDur(rtt, time.Microsecond)
++	h := &s.health
++	h.latest.Store(int64(rtt))
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.srtt == 0 {
++		h.srtt, h.rttvar = rtt, rtt/2
++		return
++	}
++	diff := h.srtt - rtt
++	if diff < 0 {
++		diff = -diff
++	}
++	h.rttvar += (diff - h.rttvar) / 4
++	h.srtt += (rtt - h.srtt) / 8
++}
++
++func (s *Session) replyDeadline() time.Duration {
++	h := &s.health
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.srtt == 0 {
++		return minReplyDeadline
++	}
++	return minDur(maxDur(maxDur(h.srtt+4*h.rttvar, replyRoundTrips*h.srtt), minReplyDeadline), maxReplyDeadline)
++}
++
++// ping sends a heartbeat request whose stream id field carries the ping id.
++func (s *Session) ping() {
++	if !s.health.pinging.CompareAndSwap(false, true) {
++		return
++	}
++	defer s.health.pinging.Store(false)
++	h := &s.health
++	h.mu.Lock()
++	if h.pings == nil {
++		h.pings = make(map[uint32]time.Time)
++	}
++	id := h.nextPing
++	h.nextPing++
++	now := time.Now()
++	h.pings[id] = now
++	h.pingAt = now.Add(pingInterval + time.Duration(rand.Int63n(int64(pingJitter))))
++	h.mu.Unlock()
++	s.writeControlFrame(newFrame(cmdHeartRequest, id))
++}
++
++// pong settles ping id and every older one, as the peer answers in order.
++func (s *Session) pong(id uint32) {
++	h := &s.health
++	h.mu.Lock()
++	sent, ok := h.pings[id]
++	for older := range h.pings {
++		if older <= id {
++			delete(h.pings, older)
++		}
++	}
++	h.mu.Unlock()
++	if ok {
++		s.sample(time.Since(sent))
++	}
++}
++
++// pingDue reports whether an idle session should be pinged: once its random interval
++// since the last ping has passed.
++func (s *Session) pingDue(now time.Time) bool {
++	if s.peerVersion < 2 {
++		return false // heartbeats arrived with version 2
++	}
++	s.health.mu.Lock()
++	at := s.health.pingAt
++	s.health.mu.Unlock()
++	return !now.Before(at)
++}
++
++// unresponsive reports whether a ping has waited past the reply deadline while
++// nothing else arrived for as long.
++func (s *Session) unresponsive(now time.Time) bool {
++	d := s.replyDeadline()
++	if now.Sub(time.Unix(0, s.health.lastRecv.Load())) < d {
++		return false
++	}
++	h := &s.health
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	for _, sent := range h.pings {
++		if now.Sub(sent) >= d {
++			return true
++		}
++	}
++	return false
++}
++
++// expectedWait estimates how long a new stream would wait for a reply: the latest
++// round trip, or longer while a ping has gone unanswered for longer. It is negative
++// while neither is known.
++func (s *Session) expectedWait(now time.Time) time.Duration {
++	wait := time.Duration(-1)
++	if latest := s.health.latest.Load(); latest != 0 {
++		wait = time.Duration(latest)
++	}
++	h := &s.health
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	for _, sent := range h.pings {
++		wait = maxDur(wait, now.Sub(sent))
++	}
++	return wait
++}
++
++// choose returns the index of the first candidate, in preference order, whose
++// expected wait is unknown or within the band of the best known one.
++func choose(waits []time.Duration) int {
++	fastest := time.Duration(-1)
++	for _, w := range waits {
++		if w >= 0 && (fastest < 0 || w < fastest) {
++			fastest = w
++		}
++	}
++	limit := fastest + maxDur(fastest/4, minWaitBand)
++	for i, w := range waits {
++		if fastest < 0 || w <= limit {
++			return i
++		}
++	}
++	return -1
++}
++
++// writeDataFrameDRS writes small frames first after the session was idle, so the
++// receiver can decrypt the first TLS records of a response without waiting for a
++// full 16 KiB one.
++func (s *Session) writeDataFrameDRS(sid uint32, data []byte) (int, error) {
++	h := &s.health
++	h.drsMu.Lock()
++	defer h.drsMu.Unlock()
++	now := time.Now()
++	if h.drsLimit == 0 || now.Sub(h.drsLast) > drsIdleReset {
++		h.drsLimit = drsSegment
++	}
++	h.drsLast = now
++	written := 0
++	for written < len(data) && h.drsLimit < drsMax {
++		size := len(data) - written
++		if size > h.drsLimit {
++			size = h.drsLimit
++		}
++		n, err := s.writeFrames(sid, data[written:written+size])
++		written += n
++		if err != nil {
++			return written, err
++		}
++		h.drsLimit += drsSegment
++		if h.drsLimit > drsMax {
++			h.drsLimit = drsMax
++		}
++	}
++	if written < len(data) {
++		n, err := s.writeFrames(sid, data[written:])
++		return written + n, err
++	}
++	return written, nil
++}
++
++func minDur(a, b time.Duration) time.Duration {
++	if a < b {
++		return a
++	}
++	return b
++}
++
++func maxDur(a, b time.Duration) time.Duration {
++	if a > b {
++		return a
++	}
++	return b
++}
+diff --git a/transport/anytls/session/health_test.go b/transport/anytls/session/health_test.go
+new file mode 100644
+index 00000000..5a0174d5
+--- /dev/null
++++ b/transport/anytls/session/health_test.go
+@@ -0,0 +1,164 @@
++package session
++
++import (
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/transport/anytls/padding"
++)
++
++func TestReplyDeadlineBounds(t *testing.T) {
++	var s Session
++	if d := s.replyDeadline(); d != minReplyDeadline {
++		t.Fatalf("unmeasured deadline = %v, want %v", d, minReplyDeadline)
++	}
++	s.sample(20 * time.Millisecond)
++	if d := s.replyDeadline(); d != minReplyDeadline {
++		t.Fatalf("fast link deadline = %v, want floor %v", d, minReplyDeadline)
++	}
++	var slow Session
++	slow.sample(5 * time.Second)
++	if d := slow.replyDeadline(); d != maxReplyDeadline {
++		t.Fatalf("slow link deadline = %v, want cap %v", d, maxReplyDeadline)
++	}
++}
++
++func TestPingIntervalJitter(t *testing.T) {
++	c, peer := net.Pipe()
++	defer c.Close()
++	defer peer.Close()
++	go io.Copy(io.Discard, peer)
++
++	s := &Session{conn: c, peerVersion: 2, die: make(chan struct{})}
++	now := time.Now()
++	if !s.pingDue(now) {
++		t.Fatal("a session never pinged should be due")
++	}
++	seen := map[time.Duration]bool{}
++	for i := 0; i < 20; i++ {
++		before := time.Now()
++		s.ping()
++		s.health.mu.Lock()
++		gap := s.health.pingAt.Sub(before)
++		s.health.mu.Unlock()
++		if gap < pingInterval || gap > pingInterval+pingJitter+time.Second {
++			t.Fatalf("next ping in %v, want within [%v, %v)", gap, pingInterval, pingInterval+pingJitter)
++		}
++		if s.pingDue(before.Add(pingInterval - time.Second)) {
++			t.Fatal("ping due before the minimum interval")
++		}
++		seen[gap.Round(time.Second)] = true
++	}
++	if len(seen) < 2 {
++		t.Fatal("ping interval is not randomized")
++	}
++}
++
++// newSessionPair connects a client and a server session over a pipe. Every stream
++// the server accepts is handed to onStream after its SYNACK decision is left to it.
++func newSessionPair(t *testing.T, onStream func(*Stream)) (*Session, *Session) {
++	t.Helper()
++	var pad atomic.Pointer[padding.PaddingFactory]
++	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &pad)
++	cConn, sConn := net.Pipe()
++	server := NewServerSession(sConn, onStream, &pad)
++	go server.Run()
++	client := NewClientSession(cConn, &pad, "test")
++	client.Run()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	return client, server
++}
++
++// openFirst opens stream 1 and waits for its echo, so settings are exchanged.
++func openFirst(t *testing.T, client *Session) *Stream {
++	t.Helper()
++	s1, err := client.OpenStream()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s1.Write([]byte("ping")); err != nil {
++		t.Fatal(err)
++	}
++	buf := make([]byte, 4)
++	if _, err := io.ReadFull(s1, buf); err != nil {
++		t.Fatal(err)
++	}
++	if !client.peerExt.Load() {
++		t.Fatal("server did not confirm the extension")
++	}
++	return s1
++}
++
++func TestSlowSynAckKeepsLiveSession(t *testing.T) {
++	stop := make(chan struct{})
++	defer close(stop)
++	client, _ := newSessionPair(t, func(st *Stream) {
++		if st.id != 1 {
++			// Acknowledge only well past the deadline.
++			select {
++			case <-time.After(minReplyDeadline + 2*time.Second):
++				_ = st.HandshakeSuccess()
++			case <-stop:
++			}
++			return
++		}
++		_ = st.HandshakeSuccess()
++		buf := make([]byte, 4)
++		if _, err := io.ReadFull(st, buf); err != nil {
++			return
++		}
++		_, _ = st.Write(buf)
++		// Keep stream 1 busy, as a download would.
++		for {
++			select {
++			case <-stop:
++				return
++			case <-time.After(200 * time.Millisecond):
++			}
++			if _, err := st.Write([]byte("data")); err != nil {
++				return
++			}
++		}
++	})
++	s1 := openFirst(t, client)
++	go io.Copy(io.Discard, s1)
++
++	if _, err := client.OpenStream(); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(minReplyDeadline + time.Second)
++	if client.IsClosed() {
++		t.Fatal("session with a busy stream was closed for one slow SYNACK")
++	}
++}
++
++func TestSilentSessionClosesAfterDeadline(t *testing.T) {
++	client, _ := newSessionPair(t, func(st *Stream) {
++		if st.id != 1 {
++			return // never acknowledged, and nothing else is sent
++		}
++		_ = st.HandshakeSuccess()
++		buf := make([]byte, 4)
++		if _, err := io.ReadFull(st, buf); err == nil {
++			_, _ = st.Write(buf)
++		}
++	})
++	openFirst(t, client)
++
++	if _, err := client.OpenStream(); err != nil {
++		t.Fatal(err)
++	}
++	deadline := time.Now().Add(minReplyDeadline + 2*time.Second)
++	for !client.IsClosed() {
++		if time.Now().After(deadline) {
++			t.Fatal("silent session was not closed after the SYNACK deadline")
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++}
+diff --git a/transport/anytls/session/session.go b/transport/anytls/session/session.go
+index f2b3b199..9a11f97d 100644
+--- a/transport/anytls/session/session.go
++++ b/transport/anytls/session/session.go
+@@ -41,6 +41,10 @@ type Session struct {
+ 
+ 	peerVersion byte
+ 
++	// peerExt is set once the peer has confirmed the extension in its settings.
++	peerExt atomic.Bool
++	health  sessionHealth
++
+ 	// client
+ 	isClient       bool
+ 	sendPadding    bool
+@@ -88,6 +92,7 @@ func (s *Session) Run() {
+ 		"client":      s.clientMetadata,
+ 		"padding-md5": s.padding.Load().Md5,
+ 	}
++	settings[extKey] = extValue
+ 	f := newFrame(cmdSettings, 0)
+ 	f.data = settings.ToBytes()
+ 	s.buffering = true
+@@ -139,18 +144,30 @@ func (s *Session) OpenStream() (*Stream, error) {
+ 
+ 	sid := s.streamId.Add(1)
+ 	stream := newStream(sid, s)
++	synAt := time.Now().UnixNano()
+ 
+ 	if sid >= 2 && s.peerVersion >= 2 {
+ 		s.synDoneLock.Lock()
+ 		if s.synDone != nil {
+ 			s.synDone()
+ 		}
+-		s.synDone = util.NewDeadlineWatcher(time.Second*3, func() {
++		ddl := time.Second * 3
++		if s.peerExt.Load() {
++			// A peer with the extension acknowledges a stream before dialing its destination.
++			ddl = s.replyDeadline()
++		}
++		s.synDone = util.NewDeadlineWatcher(ddl, func() {
++			// Frames that arrived after the SYN show the session is still alive, so a
++			// slow SYNACK must not tear down the other streams on it.
++			if s.health.lastRecv.Load() > synAt {
++				return
++			}
+ 			s.Close()
+ 		})
+ 		s.synDoneLock.Unlock()
+ 	}
+ 
++	s.health.synSent.Store(synAt)
+ 	if _, err := s.writeControlFrame(newFrame(cmdSYN, sid)); err != nil {
+ 		return nil, err
+ 	}
+@@ -185,6 +202,7 @@ func (s *Session) recvLoop() error {
+ 		}
+ 		// read header first
+ 		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
++			s.health.lastRecv.Store(time.Now().UnixNano())
+ 			sid := hdr.StreamID()
+ 			switch hdr.Cmd() {
+ 			case cmdPSH:
+@@ -224,6 +242,9 @@ func (s *Session) recvLoop() error {
+ 				}
+ 				s.streamLock.Unlock()
+ 			case cmdSYNACK: // should be client only
++				if sent := s.health.synSent.Swap(0); sent != 0 && s.peerExt.Load() {
++					s.sample(time.Since(time.Unix(0, sent)))
++				}
+ 				s.synDoneLock.Lock()
+ 				if s.synDone != nil {
+ 					s.synDone()
+@@ -286,10 +307,15 @@ func (s *Session) recvLoop() error {
+ 						if v, err := strconv.Atoi(m["v"]); err == nil && v >= 2 {
+ 							s.peerVersion = byte(v)
+ 							// send cmdServerSettings
+-							f := newFrame(cmdServerSettings, 0)
+-							f.data = util.StringMap{
++							serverSettings := util.StringMap{
+ 								"v": "2",
+-							}.ToBytes()
++							}
++							if m[extKey] == extValue {
++								s.peerExt.Store(true)
++								serverSettings[extKey] = extValue
++							}
++							f := newFrame(cmdServerSettings, 0)
++							f.data = serverSettings.ToBytes()
+ 							_, err = s.writeControlFrame(f)
+ 							if err != nil {
+ 								pool.Put(buffer)
+@@ -332,8 +358,9 @@ func (s *Session) recvLoop() error {
+ 					return err
+ 				}
+ 			case cmdHeartResponse:
+-				// Active keepalive checking is not implemented yet
+-				break
++				if s.isClient {
++					s.pong(sid)
++				}
+ 			case cmdServerSettings:
+ 				if hdr.Length() > 0 {
+ 					buffer := pool.Get(int(hdr.Length()))
+@@ -347,6 +374,9 @@ func (s *Session) recvLoop() error {
+ 						if v, err := strconv.Atoi(m["v"]); err == nil {
+ 							s.peerVersion = byte(v)
+ 						}
++						if m[extKey] == extValue {
++							s.peerExt.Store(true)
++						}
+ 					}
+ 					pool.Put(buffer)
+ 				}
+@@ -379,6 +409,13 @@ func (s *Session) streamClosed(sid uint32) error {
+ const maxFrameDataLen = 0xFFFF
+ 
+ func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
++	if !s.isClient {
++		return s.writeDataFrameDRS(sid, data)
++	}
++	return s.writeFrames(sid, data)
++}
++
++func (s *Session) writeFrames(sid uint32, data []byte) (int, error) {
+ 	dataLen := len(data)
+ 	if dataLen == 0 {
+ 		return 0, nil
+-- 
+2.55.0.windows.5
+

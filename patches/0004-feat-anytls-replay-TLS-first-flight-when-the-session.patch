@@ -1,0 +1,360 @@
+From c6f24e07bbcf0c168dee629bd91ade02d61b0fe2 Mon Sep 17 00:00:00 2001
+From: Syncony <110027245+Syncony@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:14:33 +0800
+Subject: [PATCH 4/5] feat(anytls): replay TLS first flight when the session
+ dies before answering
+
+Streams whose first bytes are a TLS ClientHello keep up to 64 KiB of
+what the app sent until the first response byte arrives. If the session
+closes before that, the stream reopens on another session and resends,
+at most twice. Plain requests are never replayed, and a stream stops
+being replayable as soon as it sends anything but handshake or
+change_cipher_spec records, so TLS 1.3 early data never runs twice.
+---
+ transport/anytls/client.go         |  12 +-
+ transport/anytls/replay.go         | 177 +++++++++++++++++++++++++++++
+ transport/anytls/replay_test.go    | 101 ++++++++++++++++
+ transport/anytls/session/stream.go |   5 +
+ 4 files changed, 294 insertions(+), 1 deletion(-)
+ create mode 100644 transport/anytls/replay.go
+ create mode 100644 transport/anytls/replay_test.go
+
+diff --git a/transport/anytls/client.go b/transport/anytls/client.go
+index fce4d4a6..11d4f990 100644
+--- a/transport/anytls/client.go
++++ b/transport/anytls/client.go
+@@ -53,6 +53,16 @@ func NewClient(ctx context.Context, config ClientConfig) *Client {
+ }
+ 
+ func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
++	stream, err := c.createStream(ctx, destination)
++	if err != nil {
++		return nil, err
++	}
++	r := &replayConn{client: c, destination: destination}
++	r.stream.Store(stream)
++	return r, nil
++}
++
++func (c *Client) createStream(ctx context.Context, destination M.Socksaddr) (*session.Stream, error) {
+ 	conn, err := c.sessionClient.CreateStream(ctx)
+ 	if err != nil {
+ 		return nil, err
+@@ -62,7 +72,7 @@ func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.
+ 		conn.Close()
+ 		return nil, err
+ 	}
+-	return conn, nil
++	return conn.(*session.Stream), nil
+ }
+ 
+ func (c *Client) createOutboundTLSConnection(ctx context.Context) (net.Conn, error) {
+diff --git a/transport/anytls/replay.go b/transport/anytls/replay.go
+new file mode 100644
+index 00000000..7f4231df
+--- /dev/null
++++ b/transport/anytls/replay.go
+@@ -0,0 +1,177 @@
++package anytls
++
++import (
++	"context"
++	"encoding/binary"
++	"net"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/metacubex/mihomo/transport/anytls/session"
++
++	M "github.com/metacubex/sing/common/metadata"
++)
++
++const (
++	maxReplayBuffer = 64 << 10
++	maxReplays      = 2
++	replayTimeout   = 5 * time.Second
++)
++
++// replayConn keeps what the app sent until the first response byte arrives, so a
++// stream whose session dies before answering moves to another session unnoticed.
++// Only streams that start with a TLS ClientHello and carry nothing but handshake
++// records replay: resending those just starts a fresh TLS session at the origin,
++// while a plain request or TLS 1.3 early data could run twice.
++type replayConn struct {
++	client      *Client
++	destination M.Socksaddr
++
++	stream     atomic.Pointer[session.Stream]
++	replayable atomic.Bool
++	answered   atomic.Bool
++	closed     atomic.Bool
++
++	readDeadline  atomic.Pointer[time.Time]
++	writeDeadline atomic.Pointer[time.Time]
++
++	mu      sync.Mutex // guards the replay buffer and serializes replays; not held while writing
++	started bool
++	sent    []byte
++	scanned int // offset of the next TLS record header in sent
++	replays int
++}
++
++func (r *replayConn) Read(b []byte) (int, error) {
++	for {
++		s := r.stream.Load()
++		n, err := s.Read(b)
++		if n > 0 {
++			r.answered.Store(true)
++			return n, err
++		}
++		if err == nil {
++			return 0, nil
++		}
++		r.mu.Lock()
++		replayed := r.replayLocked(s)
++		r.mu.Unlock()
++		if !replayed {
++			return n, err
++		}
++	}
++}
++
++func (r *replayConn) Write(b []byte) (int, error) {
++	r.mu.Lock()
++	if !r.started {
++		r.started = true
++		// A handshake record (0x16) whose first message is a ClientHello (0x01).
++		if len(b) >= 6 && b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01 {
++			r.replayable.Store(true)
++		}
++	}
++	if r.replayable.Load() && !r.answered.Load() {
++		if len(r.sent)+len(b) <= maxReplayBuffer {
++			r.sent = append(r.sent, b...)
++			if !handshakeOnly(r.sent, &r.scanned) {
++				r.replayable.Store(false)
++				r.sent = nil
++			}
++		} else {
++			r.replayable.Store(false)
++			r.sent = nil
++		}
++	} else {
++		r.sent = nil
++	}
++	s := r.stream.Load()
++	r.mu.Unlock()
++	// A write stuck on a dead session must not keep Read from reporting the error.
++	n, err := s.Write(b)
++	if err != nil {
++		r.mu.Lock()
++		replayed := r.replayLocked(s)
++		r.mu.Unlock()
++		if replayed {
++			// b went out with the buffer resent on the new stream.
++			return len(b), nil
++		}
++	}
++	return n, err
++}
++
++// replayLocked moves to a new stream if s failed before any response arrived
++// because its session closed, and reports whether to carry on. The caller holds r.mu.
++func (r *replayConn) replayLocked(s *session.Stream) bool {
++	if s != r.stream.Load() {
++		return true // another goroutine already moved the stream
++	}
++	if r.answered.Load() || !r.replayable.Load() || r.closed.Load() || r.replays >= maxReplays || !s.SessionClosed() {
++		return false
++	}
++	r.replays++
++	ctx, cancel := context.WithTimeout(context.Background(), replayTimeout)
++	defer cancel()
++	ns, err := r.client.createStream(ctx, r.destination)
++	if err != nil {
++		return false
++	}
++	if _, err := ns.Write(r.sent); err != nil {
++		ns.Close()
++		return false
++	}
++	if t := r.readDeadline.Load(); t != nil {
++		ns.SetReadDeadline(*t)
++	}
++	if t := r.writeDeadline.Load(); t != nil {
++		ns.SetWriteDeadline(*t)
++	}
++	r.stream.Store(ns)
++	s.Close()
++	if r.closed.Load() {
++		ns.Close()
++		return false
++	}
++	return true
++}
++
++// handshakeOnly reports whether every TLS record from *off on is a handshake (0x16)
++// or change_cipher_spec (0x14) record, advancing *off past the complete ones.
++// Any other record, such as TLS 1.3 early data, carries application data.
++func handshakeOnly(b []byte, off *int) bool {
++	for *off < len(b) {
++		if t := b[*off]; t != 0x16 && t != 0x14 {
++			return false
++		}
++		if *off+5 > len(b) {
++			return true // the rest of the header comes with the next write
++		}
++		*off += 5 + int(binary.BigEndian.Uint16(b[*off+3:]))
++	}
++	return true
++}
++
++func (r *replayConn) Close() error {
++	r.closed.Store(true)
++	return r.stream.Load().Close()
++}
++
++func (r *replayConn) LocalAddr() net.Addr  { return r.stream.Load().LocalAddr() }
++func (r *replayConn) RemoteAddr() net.Addr { return r.stream.Load().RemoteAddr() }
++
++func (r *replayConn) SetDeadline(t time.Time) error {
++	r.SetWriteDeadline(t)
++	return r.SetReadDeadline(t)
++}
++
++func (r *replayConn) SetReadDeadline(t time.Time) error {
++	r.readDeadline.Store(&t)
++	return r.stream.Load().SetReadDeadline(t)
++}
++
++func (r *replayConn) SetWriteDeadline(t time.Time) error {
++	r.writeDeadline.Store(&t)
++	return r.stream.Load().SetWriteDeadline(t)
++}
+diff --git a/transport/anytls/replay_test.go b/transport/anytls/replay_test.go
+new file mode 100644
+index 00000000..2c3e9477
+--- /dev/null
++++ b/transport/anytls/replay_test.go
+@@ -0,0 +1,101 @@
++package anytls
++
++import (
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++
++	"github.com/metacubex/mihomo/transport/anytls/padding"
++	"github.com/metacubex/mihomo/transport/anytls/session"
++)
++
++// record builds a TLS record of type t whose body starts with first.
++func record(t byte, first byte, size int) []byte {
++	b := make([]byte, 5+size)
++	b[0], b[1], b[2] = t, 0x03, 0x01
++	b[3], b[4] = byte(size>>8), byte(size)
++	if size > 0 {
++		b[5] = first
++	}
++	return b
++}
++
++func TestHandshakeOnly(t *testing.T) {
++	hello := record(0x16, 0x01, 200)
++	ccs := record(0x14, 0x01, 1)
++	early := record(0x17, 0x00, 50)
++
++	off := 0
++	if !handshakeOnly(hello, &off) || off != len(hello) {
++		t.Fatalf("ClientHello rejected, off=%d", off)
++	}
++	b := append(append([]byte{}, hello...), ccs...)
++	off = 0
++	if !handshakeOnly(b, &off) {
++		t.Fatal("ClientHello + ChangeCipherSpec rejected")
++	}
++	b = append(b, early...)
++	if handshakeOnly(b, &off) {
++		t.Fatal("early data accepted")
++	}
++	// A header split across writes is judged once its type byte arrives.
++	off = 0
++	if !handshakeOnly(hello[:3], &off) || off != 0 {
++		t.Fatal("partial header mishandled")
++	}
++}
++
++func newStream(t *testing.T) *session.Stream {
++	t.Helper()
++	var pad atomic.Pointer[padding.PaddingFactory]
++	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &pad)
++	cConn, sConn := net.Pipe()
++	server := session.NewServerSession(sConn, func(st *session.Stream) {
++		_ = st.HandshakeSuccess()
++		_, _ = io.Copy(io.Discard, st)
++	}, &pad)
++	go server.Run()
++	client := session.NewClientSession(cConn, &pad, "test")
++	client.Run()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	st, err := client.OpenStream()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return st
++}
++
++func TestReplayBuffersOnlyClientHello(t *testing.T) {
++	cases := []struct {
++		name   string
++		writes [][]byte
++		want   bool
++	}{
++		{"client hello", [][]byte{record(0x16, 0x01, 300)}, true},
++		{"hello then ccs", [][]byte{record(0x16, 0x01, 300), record(0x14, 0x01, 1)}, true},
++		{"hello then early data", [][]byte{record(0x16, 0x01, 300), record(0x17, 0x00, 80)}, false},
++		{"other handshake message", [][]byte{record(0x16, 0x02, 300)}, false},
++		{"plain request", [][]byte{[]byte("GET / HTTP/1.1\r\n\r\n")}, false},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			r := &replayConn{}
++			r.stream.Store(newStream(t))
++			for _, w := range c.writes {
++				if _, err := r.Write(w); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if got := r.replayable.Load(); got != c.want {
++				t.Fatalf("replayable = %v, want %v", got, c.want)
++			}
++			if !c.want && r.sent != nil {
++				t.Fatal("buffer kept for a stream that will not replay")
++			}
++		})
++	}
++}
+diff --git a/transport/anytls/session/stream.go b/transport/anytls/session/stream.go
+index b661fad2..ab5b26fb 100644
+--- a/transport/anytls/session/stream.go
++++ b/transport/anytls/session/stream.go
+@@ -134,6 +134,11 @@ func (s *Stream) RemoteAddr() net.Addr {
+ 	return nil
+ }
+ 
++// SessionClosed reports whether the session carrying the stream has closed.
++func (s *Stream) SessionClosed() bool {
++	return s.sess.IsClosed()
++}
++
+ // HandshakeFailure should be called when Server fail to create outbound proxy
+ func (s *Stream) HandshakeFailure(err error) error {
+ 	var once bool
+-- 
+2.55.0.windows.5
+
